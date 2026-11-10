@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.db
+*.sqlite3
+*.log
+.env
+serviceAccount*.json
+*firebase*.json
