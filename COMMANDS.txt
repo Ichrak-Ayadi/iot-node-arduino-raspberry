@@ -1,0 +1,304 @@
+=====================================================================
+ COMMANDS AND USAGE GUIDE
+ IoT environment monitoring: Arduino -> Raspberry Pi -> InfluxDB -> Grafana
+=====================================================================
+
+All commands run on the Raspberry Pi (SSH terminal), unless a line says
+"on the PC". Replace <Pi_IP> with the address of your Pi.
+Never write a token inside a command, a script or a Git folder.
+
+<pi_user> means the login name of your Raspberry Pi: the word before the "@"
+in the terminal prompt (user@hostname:~ $). Replace it everywhere you see it,
+for example in the service files in Part 6.5, before running a command.
+
+
+---------------------------------------------------------------------
+ PART 1. HOW TO USE THE PROJECT (daily use)
+---------------------------------------------------------------------
+
+1. Power the Arduino and keep it close to the Pi (Bluetooth range).
+2. Power the Pi. Two services start by themselves:
+     ble-bridge       Arduino (Bluetooth) -> MQTT
+     influx-logger    MQTT -> InfluxDB
+3. Open the dashboard in a browser:  http://<Pi_IP>:3000
+   Dashboard name: Environnement (charts: Temperature, Humidite, Pression)
+4. Set the time range (top right) to "Last 15 minutes" and the refresh to 5s.
+5. InfluxDB interface (data, tokens, queries):  http://<Pi_IP>:8086
+
+
+---------------------------------------------------------------------
+ PART 2. CHECK THAT EVERYTHING RUNS
+---------------------------------------------------------------------
+
+sudo systemctl status ble-bridge influx-logger --no-pager
+    Shows whether both of our services are "active (running)".
+
+sudo systemctl status mosquitto influxdb grafana-server --no-pager
+    Same check for the three programs they depend on.
+    (Node-RED, if installed, is "nodered" or "node-red".)
+
+mosquitto_sub -h localhost -t "#" -v
+    Prints every MQTT message live. "#" means all topics, "-v" shows the
+    topic name. You should see /temperature, /humidite, /pression lines.
+    Press Ctrl+C to stop.
+
+sudo journalctl -u ble-bridge -f
+sudo journalctl -u influx-logger -f
+    Live log of each service. Press Ctrl+C to leave (service keeps running).
+
+sudo journalctl -u ble-bridge -n 30 --no-pager
+    Last 30 log lines, useful to read an error.
+
+free -h
+    Memory use. Read the "available" column.
+
+dpkg --print-architecture
+    Must print arm64 (InfluxDB 2 needs a 64-bit system).
+
+
+---------------------------------------------------------------------
+ PART 3. MANAGE THE SERVICES
+---------------------------------------------------------------------
+
+sudo systemctl restart ble-bridge          restart one service
+sudo systemctl stop influx-logger          stop it (until next boot)
+sudo systemctl start influx-logger         start it again
+sudo systemctl disable ble-bridge          do not start it at boot
+sudo systemctl enable --now ble-bridge     start now AND at every boot
+sudo systemctl daemon-reload               re-read service files after editing
+
+Important: the Arduino accepts one Bluetooth connection at a time. If you
+run ble_bridge.py by hand, stop the service first:
+    sudo systemctl stop ble-bridge
+Likewise, stop influx-logger before running influx_logger.py by hand, or
+every value is written twice.
+
+
+---------------------------------------------------------------------
+ PART 4. TEST EACH LINK OF THE CHAIN
+---------------------------------------------------------------------
+
+4.1 Send a fake value through MQTT (no Arduino needed)
+
+    mosquitto_pub -h localhost -t "/temperature" -m "25.5"
+
+  Publishes 25.5 on the topic /temperature. If influx-logger runs, the
+  value is written in InfluxDB.
+
+4.2 Write a test point straight into InfluxDB (checks the token)
+
+    curl -s -o /dev/null -w "%{http_code}\n" -XPOST \
+      "http://localhost:8086/api/v2/write?org=iot&bucket=mesures&precision=s" \
+      -H "Authorization: Token $(tr -d '[:space:]' < ~/secrets/influx-token)" \
+      --data-raw "test,source=curl value=1"
+
+  Prints only the HTTP code:
+    204  the write worked, the token is good
+    401  token empty, incomplete, or without write permission
+    404  organization or bucket name does not exist
+
+4.3 Read data in InfluxDB (Data Explorer > Script Editor)
+
+    from(bucket: "mesures")
+      |> range(start: -1h)
+      |> filter(fn: (r) => r._measurement == "environnement")
+
+  Shows everything written during the last hour.
+
+4.4 Grafana panel query (one panel per field)
+
+    from(bucket: "mesures")
+      |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+      |> filter(fn: (r) => r._measurement == "environnement")
+      |> filter(fn: (r) => r._field == "temperature")
+
+  Change "temperature" to "humidite" or "pression" for the other panels.
+
+
+---------------------------------------------------------------------
+ PART 5. TOKENS: HOW TO HANDLE THEM SAFELY
+---------------------------------------------------------------------
+
+Two InfluxDB tokens exist:
+  mqtt-logger   Write only on bucket mesures   (used by influx_logger.py)
+  grafana-read  Read only on bucket mesures    (used by Grafana)
+
+InfluxDB 2.9 and newer shows a token only ONCE, at creation.
+A normal InfluxDB token is exactly 88 characters.
+
+5.1 Store the logger token in a protected file
+
+    mkdir -p ~/secrets
+    chmod 700 ~/secrets
+    chmod 600 ~/secrets/influx-token
+        Only your account can read the folder and the file.
+
+5.2 Check the token WITHOUT showing it
+
+    tr -d '[:space:]' < ~/secrets/influx-token | wc -c
+        Counts the characters. You want 88.
+
+5.3 If pasting into the terminal loses characters (it happened here)
+
+  Send the token as a file instead of pasting it.
+  1. Paste the token in Notepad, check the length (status bar: Col 89
+     at the end of the line), save as token.txt.
+  2. On the PC, in PowerShell:
+         scp token.txt <pi_user>@<Pi_IP>:/home/<pi_user>/secrets/influx-token
+  3. On the Pi, repeat 5.1 and 5.2, then run the test 4.2.
+  4. Delete token.txt on the PC and empty the Recycle Bin.
+
+5.4 If a token is lost or rejected
+
+  Do not repair it. In InfluxDB: Load Data > API Tokens, delete it, create a
+  new Custom API Token with the right bucket permission, and send it again.
+
+
+---------------------------------------------------------------------
+ PART 6. INSTALLATION (done once)
+---------------------------------------------------------------------
+
+6.1 InfluxDB 2
+
+    cd ~
+    curl --silent --location -O https://repos.influxdata.com/influxdata-archive.key
+        Downloads InfluxData's signing key.
+
+    gpg --show-keys --with-fingerprint --with-colons ./influxdata-archive.key 2>&1 \
+      | grep -q '^fpr::*24C975CBA61A024EE1B631787C3D57159FC2F927:$' \
+      && echo "FINGERPRINT OK" || echo "FINGERPRINT DIFFERENT"
+        Checks the key's fingerprint. Continue only if it prints
+        FINGERPRINT OK. InfluxData rotates its keys from time to time, so
+        compare with the fingerprint in their current install page.
+
+    sudo mkdir -p /etc/apt/keyrings
+    cat influxdata-archive.key | gpg --dearmor | sudo tee /etc/apt/keyrings/influxdata-archive.gpg > /dev/null
+        Converts the key to the format apt expects and installs it.
+
+    echo 'deb [signed-by=/etc/apt/keyrings/influxdata-archive.gpg] https://repos.influxdata.com/debian stable main' \
+      | sudo tee /etc/apt/sources.list.d/influxdata.list
+        Adds the InfluxData repository (check the exact line in their docs).
+
+    sudo apt-get update && sudo apt-get install -y influxdb2
+    sudo systemctl enable --now influxdb
+        Installs InfluxDB, starts it now and at every boot.
+
+  Then open http://<Pi_IP>:8086 > Get Started:
+    Organization: iot      Bucket: mesures
+  Create the two tokens from Part 5 (Load Data > API Tokens).
+
+6.2 Mosquitto (MQTT broker)
+
+    sudo apt-get install -y mosquitto mosquitto-clients
+    sudo systemctl enable --now mosquitto
+        mosquitto-clients provides mosquitto_pub and mosquitto_sub.
+
+6.3 Grafana
+
+    Install it from Grafana's official apt repository (see grafana.com/docs),
+    then:
+        sudo systemctl enable --now grafana-server
+    Open http://<Pi_IP>:3000 and change the default password.
+
+    Add the data source: Connections > Data sources > Add data source >
+    InfluxDB, then:
+        Query language   Flux
+        URL              http://localhost:8086
+        Organization     iot
+        Token            the read-only token (grafana-read)
+        Default bucket   mesures
+    Click "Save & test": you want a green message.
+
+6.4 Python libraries
+
+    python3 -m pip install paho-mqtt influxdb-client --break-system-packages
+    python3 -c "import influxdb_client; print('influx OK')"
+        --break-system-packages is needed on recent Raspberry Pi OS.
+        The BLE and Firebase scripts have their own libraries: see the
+        "import" lines at the top of ble_bridge.py and firebase_logger.py.
+
+6.5 The two services (create once)
+
+sudo tee /etc/systemd/system/influx-logger.service > /dev/null << 'EOF'
+[Unit]
+Description=MQTT to InfluxDB logger
+After=network-online.target mosquitto.service influxdb.service
+Wants=network-online.target
+
+[Service]
+User=<pi_user>
+ExecStart=/usr/bin/python3 -u /home/<pi_user>/iot_bridge/influx_logger.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo tee /etc/systemd/system/ble-bridge.service > /dev/null << 'EOF'
+[Unit]
+Description=Arduino BLE to MQTT bridge
+After=bluetooth.service mosquitto.service
+Wants=bluetooth.service
+
+[Service]
+User=<pi_user>
+ExecStart=/usr/bin/python3 -u /home/<pi_user>/iot_bridge/ble_bridge.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now influx-logger ble-bridge
+
+  Notes: "Restart=always" restarts a service that crashes. Replace
+  <pi_user> with your Pi login in both files before pasting. If the BLE
+  service shows a permission error: sudo usermod -aG bluetooth <pi_user>,
+  then restart it.
+  Copy each block from its "sudo tee" line down to the line that says EOF.
+
+
+---------------------------------------------------------------------
+ PART 7. GIT AND GITHUB
+---------------------------------------------------------------------
+
+    cd ~/iot_bridge
+    git status                  what changed since the last commit
+    git add <file>              stage a file
+    git commit -m "message"     save a version locally
+    git push                    send it to GitHub
+
+  GitHub asks for a username and a PERSONAL ACCESS TOKEN (not your password).
+  Error 403 "Permission denied" means the token has no write access: create
+  a fine-grained token (Settings > Developer settings > Personal access
+  tokens) with Repository access on this repository and
+  Contents = Read and write.
+
+  Forget a wrong saved login:
+    printf "protocol=https\nhost=github.com\n\n" | git credential reject
+
+  Keep copies of the service files in the repository:
+    mkdir -p ~/iot_bridge/systemd
+    cp /etc/systemd/system/influx-logger.service /etc/systemd/system/ble-bridge.service ~/iot_bridge/systemd/
+
+  Never commit tokens or the Firebase key. They live in ~/secrets, and
+  .gitignore excludes key files.
+
+
+---------------------------------------------------------------------
+ PART 8. TROUBLESHOOTING TABLE
+---------------------------------------------------------------------
+
+ Symptom                        Check                           Fix
+ ------------------------------ ------------------------------- ---------------------------
+ influx-logger shows 401        wc -c of the token file (88?)   New token, send via scp, test 4.2
+ Test 4.2 gives 404             Names in InfluxDB               Org must be iot, bucket mesures
+ No lines in mosquitto_sub      status of ble-bridge            Restart it, move Arduino closer
+ ble-bridge cannot connect      Is Arduino powered and in range Wait: it retries every 10 s
+ Dashboard empty                Time range, field name          Last 15 minutes, check query
+ Grafana "Save & test" error    URL, org, token, bucket         Use http://localhost:8086
+ Values written twice           Script run by hand + service    Stop the extra copy
+ After reboot nothing runs      systemctl is-enabled <service>  sudo systemctl enable --now ...
