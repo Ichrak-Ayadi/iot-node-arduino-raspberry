@@ -51,7 +51,6 @@ iot_bridge/
 ├── firebase_test.py     Firebase connection test
 ├── systemd/             service files (ble-bridge, influx-logger)
 ├── architecture.svg     architecture diagram
-├── REPORT.md            short project report
 ├── COMMANDS.txt         commands with explanations
 └── README.md            this file
 ```
